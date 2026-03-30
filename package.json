@@ -1,0 +1,26 @@
+{
+  "name": "com.glyphlabs.resonancesync",
+  "version": "0.1.0",
+  "displayName": "ResonanceSync",
+  "description": "A modular, data-driven lip sync system for Unity. Converts audio into reusable viseme animation data (ScriptableObjects) played back at runtime via blendshapes. Supports amplitude/FFT-based and Rhubarb phoneme-based generation.",
+  "unity": "2021.3",
+  "unityRelease": "0f1",
+  "documentationUrl": "",
+  "changelogUrl": "",
+  "licensesUrl": "",
+  "author": {
+    "name": "Glyph Labs",
+    "email": "",
+    "url": ""
+  },
+  "keywords": [
+    "lip sync",
+    "viseme",
+    "blendshape",
+    "audio",
+    "animation",
+    "character"
+  ],
+  "category": "Animation",
+  "dependencies": {}
+}

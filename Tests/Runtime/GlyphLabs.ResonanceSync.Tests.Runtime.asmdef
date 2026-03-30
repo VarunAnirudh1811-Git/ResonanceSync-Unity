@@ -1,0 +1,22 @@
+{
+    "name": "GlyphLabs.ResonanceSync.Tests.Runtime",
+    "rootNamespace": "GlyphLabs.ResonanceSync",
+    "references": [
+        "GlyphLabs.ResonanceSync.Runtime",
+        "UnityEngine.TestRunner",
+        "UnityEditor.TestRunner"
+    ],
+    "includePlatforms": [],
+    "excludePlatforms": [],
+    "allowUnsafeCode": false,
+    "overrideReferences": true,
+    "precompiledReferences": [
+        "nunit.framework.dll"
+    ],
+    "autoReferenced": false,
+    "defineConstraints": [
+        "UNITY_INCLUDE_TESTS"
+    ],
+    "versionDefines": [],
+    "noEngineReferences": false
+}

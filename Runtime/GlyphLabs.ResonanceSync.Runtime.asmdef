@@ -1,0 +1,14 @@
+{
+    "name": "GlyphLabs.ResonanceSync.Runtime",
+    "rootNamespace": "GlyphLabs.ResonanceSync",
+    "references": [],
+    "includePlatforms": [],
+    "excludePlatforms": [],
+    "allowUnsafeCode": false,
+    "overrideReferences": false,
+    "precompiledReferences": [],
+    "autoReferenced": true,
+    "defineConstraints": [],
+    "versionDefines": [],
+    "noEngineReferences": false
+}
