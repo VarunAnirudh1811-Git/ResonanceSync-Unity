@@ -417,7 +417,7 @@ namespace GlyphLabs.ResonanceSync
         /// Editor-only setup used by ResonanceSyncEditorWindow preview.
         /// Not part of the public runtime API — stripped from builds.
         /// </summary>
-        internal void EditorSetup(SkinnedMeshRenderer mesh, VisemeProfile profile)
+        public void EditorSetup(SkinnedMeshRenderer mesh, VisemeProfile profile)
         {
             _skinnedMesh = mesh;
             _visemeProfile = profile;

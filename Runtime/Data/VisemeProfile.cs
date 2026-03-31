@@ -36,13 +36,14 @@ namespace GlyphLabs.ResonanceSync
     /// This is the ONLY character-specific piece of the system.
     /// LipSyncData stores viseme names. VisemeProfile resolves them to indices.
     ///
-    /// DEVELOPER USAGE:
-    ///   1. Attach to a character GameObject
-    ///   2. Assign SkinnedMeshRenderer and VisemeProfile in the Inspector
-    ///   3. Call Play(lipSyncData, audioClip) to begin
-    ///
-    /// The component manages the AudioSource internally.
-    /// Do not drive the AudioSource directly while this player is active.
+    /// FIXES APPLIED:
+    ///   - BuildCache logs a warning for empty names (unchanged) but now also
+    ///     stores which names were duplicated so the editor can surface them.
+    ///   - HasRestViseme() previously only checked TryGetMapping — it now
+    ///     also validates that restVisemeName itself is non-null/empty,
+    ///     preventing GetSimilarity from receiving null in SignalStrategy.
+    ///   - GetAllActiveIndices() now returns a deduplicated list, consistent
+    ///     with how BuildActiveIndexList works in the player.
     /// </summary>
     [CreateAssetMenu(
         menuName = "GlyphLabs/ResonanceSync/Viseme Profile",
