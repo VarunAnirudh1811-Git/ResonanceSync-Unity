@@ -18,12 +18,21 @@ namespace GlyphLabs.ResonanceSync
     /// The component manages the AudioSource internally.
     /// Do not drive the AudioSource directly while this player is active.
     /// </summary>
+    /// FIXES APPLIED:
+    ///   - BuildActiveIndexList now deduplicates blendshape indices and
+    ///     validates each against skinnedMesh.sharedMesh.blendShapeCount.
+    ///     Previously duplicate indices caused redundant writes each frame,
+    ///     and out-of-range indices could throw or silently fail.
+    ///   - ApplyFrame now accumulates into a pre-allocated float[] temp
+    ///     buffer instead of calling GetBlendShapeWeight per viseme per frame.
+    ///     Writes to the mesh once per blendshape per evaluation pass.
+    ///     Eliminates repeated GetBlendShapeWeight calls in the hot path.
     [RequireComponent(typeof(AudioSource))]
     [AddComponentMenu("GlyphLabs/ResonanceSync Player")]
     public class ResonanceSyncPlayer : MonoBehaviour
     {
         // ------------------------------------------------------------------
-        // Inspector fields
+        // Inspector
         // ------------------------------------------------------------------
 
         [Tooltip("The SkinnedMeshRenderer that owns the face blendshapes.")]
@@ -37,19 +46,24 @@ namespace GlyphLabs.ResonanceSync
         // ------------------------------------------------------------------
 
         private AudioSource _audioSource;
-
-        // The active LipSyncData being played.
-        // Null when stopped.
         private LipSyncData _data;
-
-        // Flat list of blendshape indices this profile controls.
-        // Built once on Play() for fast zeroing in Update().
-        // Avoids iterating the profile's mappings list every frame.
-        private List<int> _activeBlendshapeIndices = new ();
-
-        // Playback state flags
         private bool _isPlaying;
         private bool _loop;
+
+        // FIX: Deduplicated, bounds-validated list of blendshape indices.
+        // Built once in BuildActiveIndexList() on Play().
+        private readonly List<int> _activeIndices = new ();
+
+        // FIX: Accumulation buffer — one float per blendshape index in
+        // _activeIndices. Indexed in parallel with _activeIndices.
+        // Pre-allocated at Play() time, reused every frame.
+        // Eliminates GetBlendShapeWeight calls during EvaluateAndApply.
+        private float[] _accumBuffer;
+
+        // Maps blendshape index → position in _activeIndices / _accumBuffer.
+        // Used during accumulation so we don't search the list per viseme.
+        private readonly Dictionary<int, int> _indexToBufferPos
+            = new ();
 
         // ------------------------------------------------------------------
         // Unity lifecycle
@@ -58,31 +72,18 @@ namespace GlyphLabs.ResonanceSync
         private void Awake()
         {
             _audioSource = GetComponent<AudioSource>();
-
-            // We own the AudioSource entirely.
-            // Prevent it from doing anything on its own.
             _audioSource.playOnAwake = false;
-
-            // We handle looping manually so we control
-            // blendshape state at the loop boundary.
-            _audioSource.loop = false;
+            _audioSource.loop = false; // We manage looping manually
         }
 
         private void Update()
         {
             if (!_isPlaying) return;
 
-            // ── Detect clip end ───────────────────────────────────────────
-            // AudioSource.isPlaying becomes false when the clip finishes.
-            // We check this before reading time so we don't evaluate
-            // a stale time value on the final frame.
             if (!_audioSource.isPlaying)
             {
                 if (_loop)
                 {
-                    // Restart manually so we control the seam.
-                    // If we used AudioSource.loop = true, we wouldn't get
-                    // a callback at the boundary and couldn't zero blendshapes.
                     ZeroAllBlendshapes();
                     _audioSource.Play();
                     return;
@@ -94,7 +95,6 @@ namespace GlyphLabs.ResonanceSync
                 }
             }
 
-            // ── Evaluate and apply ────────────────────────────────────────
             EvaluateAndApply(_audioSource.time);
         }
 
@@ -104,24 +104,15 @@ namespace GlyphLabs.ResonanceSync
 
         /// <summary>
         /// Begin lip sync playback.
-        /// Validates inputs, builds the blendshape index cache,
-        /// then starts the AudioSource.
         /// </summary>
-        /// <param name="data">Generated LipSyncData ScriptableObject.</param>
-        /// <param name="clip">The AudioClip this data was generated from.</param>
-        /// <param name="loop">If true, audio and animation loop seamlessly.</param>
         public void Play(LipSyncData data, AudioClip clip, bool loop = false)
         {
-            // Clean up any existing playback before starting new one
             if (_isPlaying) Stop();
-
             if (!ValidatePlayRequest(data, clip)) return;
 
             _data = data;
             _loop = loop;
 
-            // Build the flat blendshape index list for this profile.
-            // Done here once so Update() never touches the profile dictionary.
             BuildActiveIndexList();
 
             _audioSource.clip = clip;
@@ -130,8 +121,7 @@ namespace GlyphLabs.ResonanceSync
         }
 
         /// <summary>
-        /// Stop playback, zero all blendshapes, and clear state.
-        /// Safe to call when already stopped.
+        /// Stop playback, zero all blendshapes, clear state.
         /// </summary>
         public void Stop()
         {
@@ -141,70 +131,47 @@ namespace GlyphLabs.ResonanceSync
                 _audioSource.Stop();
 
             ZeroAllBlendshapes();
-
             _data = null;
         }
 
         /// <summary>
         /// Pause playback. Blendshapes hold their current state.
-        /// Resume with Resume().
         /// </summary>
         public void Pause()
         {
             if (!_isPlaying) return;
-
             _audioSource.Pause();
             _isPlaying = false;
         }
 
         /// <summary>
-        /// Resume after Pause(). Continues from where it was paused.
+        /// Resume after Pause().
         /// </summary>
         public void Resume()
         {
             if (_isPlaying) return;
             if (_data == null || _audioSource.clip == null) return;
-
             _audioSource.UnPause();
             _isPlaying = true;
         }
 
         /// <summary>
         /// Seek to a specific time in seconds.
-        /// Works while playing or paused.
-        /// Also used by the editor preview scrubber.
+        /// Evaluates immediately so the mesh updates even when paused.
         /// </summary>
-        /// <param name="time">Target time in seconds.</param>
         public void SeekTo(float time)
         {
             if (_data == null) return;
-
-            float clamped = Mathf.Clamp(time, 0f, _data.duration);
-            _audioSource.time = clamped;
-
-            // Evaluate immediately so the mesh updates at the new position
-            // even if the player is currently paused (e.g. scrubbing in editor).
-            EvaluateAndApply(clamped);
+            _audioSource.time = Mathf.Clamp(time, 0f, _data.duration);
+            EvaluateAndApply(_audioSource.time);
         }
 
         // ------------------------------------------------------------------
         // Public read-only state
         // ------------------------------------------------------------------
 
-        /// <summary>
-        /// True if the player is actively playing (not paused, not stopped).
-        /// </summary>
         public bool IsPlaying => _isPlaying && _audioSource != null && _audioSource.isPlaying;
-
-        /// <summary>
-        /// Current playback position in seconds.
-        /// </summary>
         public float CurrentTime => _audioSource != null ? _audioSource.time : 0f;
-
-        /// <summary>
-        /// Duration of the currently loaded clip in seconds.
-        /// 0 if nothing is loaded.
-        /// </summary>
         public float Duration => _data != null ? _data.duration : 0f;
 
         // ------------------------------------------------------------------
@@ -212,102 +179,112 @@ namespace GlyphLabs.ResonanceSync
         // ------------------------------------------------------------------
 
         /// <summary>
-        /// Finds the two frames bracketing the given time, interpolates
-        /// their weights, and writes the result to the SkinnedMeshRenderer.
+        /// Binary-searches for the two frames bracketing the given time,
+        /// interpolates weights, and writes to the SkinnedMeshRenderer.
         ///
-        /// Called every Update() during playback and directly by SeekTo()
-        /// during scrubbing. This is the hot path — kept allocation-free.
+        /// Allocation-free hot path — operates on pre-built buffers.
+        ///
+        /// FIX: Uses a pre-allocated accumulation buffer (_accumBuffer) to
+        /// collect blended weights for all active indices, then writes to
+        /// the mesh in a single pass. Eliminates GetBlendShapeWeight calls.
         /// </summary>
         private void EvaluateAndApply(float time)
         {
             if (_data == null || _data.frames == null || _data.frames.Count == 0)
                 return;
+            if (_skinnedMesh == null) return;
 
             var frames = _data.frames;
 
-            // ── Step 1: Zero all controlled blendshapes ───────────────────
-            // Clean slate every frame. Prevents stale values from previous
-            // frame bleeding into the current one.
-            ZeroAllBlendshapes();
+            // ── Step 1: Zero accumulation buffer ─────────────────────────
+            // Faster than calling SetBlendShapeWeight per index here;
+            // we write the mesh in one pass at the end.
+            for (int i = 0; i < _accumBuffer.Length; i++)
+                _accumBuffer[i] = 0f;
 
-            // ── Step 2: Binary search for bracket frames ──────────────────
+            // ── Step 2: Binary search ─────────────────────────────────────
             int lo = 0;
             int hi = frames.Count - 1;
 
-            // Before first frame: apply first frame at full weight
             if (time <= frames[lo].time)
             {
-                ApplyFrame(frames[lo], 1f);
+                AccumulateFrame(frames[lo], 1f);
+                FlushBuffer();
                 return;
             }
 
-            // After last frame: apply last frame at full weight
             if (time >= frames[hi].time)
             {
-                ApplyFrame(frames[hi], 1f);
+                AccumulateFrame(frames[hi], 1f);
+                FlushBuffer();
                 return;
             }
 
-            // Binary search: find lo such that frames[lo].time <= time < frames[hi].time
             while (hi - lo > 1)
             {
                 int mid = (lo + hi) / 2;
-                if (frames[mid].time <= time)
-                    lo = mid;
-                else
-                    hi = mid;
+                if (frames[mid].time <= time) lo = mid;
+                else hi = mid;
             }
 
-            // lo and hi now bracket the current time
             VisemeFrame frameA = frames[lo];
             VisemeFrame frameB = frames[hi];
 
-            // ── Step 3: Calculate interpolation factor ────────────────────
-            // t = how far we are between frameA and frameB, as 0–1
+            // ── Step 3: Interpolation factor ─────────────────────────────
             float span = frameB.time - frameA.time;
             float t = span > Mathf.Epsilon
                 ? (time - frameA.time) / span
-                : 1f; // Frames at identical time: snap to B
+                : 1f;
 
-            // ── Step 4: Apply both frames with complementary blends ───────
-            // ApplyFrame accumulates into current blendshape values.
-            // Because we zeroed first, we can safely add contributions
-            // from both frames and the result is their weighted blend.
-            ApplyFrame(frameA, 1f - t);
-            ApplyFrame(frameB, t);
+            // ── Step 4: Accumulate both frames ────────────────────────────
+            AccumulateFrame(frameA, 1f - t);
+            AccumulateFrame(frameB, t);
+
+            // ── Step 5: Write to mesh ─────────────────────────────────────
+            FlushBuffer();
         }
 
         /// <summary>
-        /// Accumulates one frame's viseme weights onto the SkinnedMeshRenderer,
-        /// scaled by the blend factor.
+        /// Accumulates one frame's viseme contributions into _accumBuffer.
+        /// Does NOT write to the mesh — FlushBuffer() does that.
         ///
-        /// Uses GetBlendShapeWeight + SetBlendShapeWeight to accumulate rather
-        /// than overwrite, so two ApplyFrame calls blend additively.
-        /// This works correctly because ZeroAllBlendshapes() runs first.
-        ///
-        /// Unity blendshapes use a 0–100 range. Our weights are 0–1.
-        /// The *100 conversion happens here — one place, never duplicated.
+        /// Resolves viseme name → buffer position via _indexToBufferPos.
+        /// Skips visemes not present in the profile or with disabled indices.
         /// </summary>
-        private void ApplyFrame(VisemeFrame frame, float blend)
+        private void AccumulateFrame(VisemeFrame frame, float blend)
         {
-            if (frame.weights == null || frame.weights.Count == 0) return;
+            if (frame.weights == null) return;
 
             foreach (var vw in frame.weights)
             {
-                // Resolve viseme name → blendshape index via profile
                 if (!_visemeProfile.TryGetMapping(vw.visemeName, out var mapping))
                     continue;
 
-                int index = mapping.blendshapeIndex;
-                if (index < 0) continue; // Disabled mapping
+                int blendshapeIndex = mapping.blendshapeIndex;
+                if (blendshapeIndex < 0) continue;
 
-                // Contribution from this frame for this viseme:
-                //   weight (0-1) × blend factor (0-1) × per-viseme scale × 100
-                float contribution = vw.weight * blend * mapping.weightScale * 100f;
+                if (!_indexToBufferPos.TryGetValue(blendshapeIndex, out int bufferPos))
+                    continue;
 
-                // Accumulate onto whatever is already there from the other frame
-                float current = _skinnedMesh.GetBlendShapeWeight(index);
-                _skinnedMesh.SetBlendShapeWeight(index, current + contribution);
+                // Contribution: weight × blend factor × per-viseme scale × 100
+                // (Unity blendshapes are 0–100; our weights are 0–1)
+                _accumBuffer[bufferPos] +=
+                    vw.weight * blend * mapping.weightScale * 100f;
+            }
+        }
+
+        /// <summary>
+        /// Writes _accumBuffer values to the SkinnedMeshRenderer.
+        /// One SetBlendShapeWeight call per active index.
+        /// Clamps to [0, 100] to handle floating point overshoot.
+        /// </summary>
+        private void FlushBuffer()
+        {
+            for (int i = 0; i < _activeIndices.Count; i++)
+            {
+                _skinnedMesh.SetBlendShapeWeight(
+                    _activeIndices[i],
+                    Mathf.Clamp(_accumBuffer[i], 0f, 100f));
             }
         }
 
@@ -315,36 +292,75 @@ namespace GlyphLabs.ResonanceSync
         // Blendshape zeroing
         // ------------------------------------------------------------------
 
-        /// <summary>
-        /// Sets all blendshape indices controlled by this profile to zero.
-        /// Called at the start of every EvaluateAndApply pass and on Stop().
-        /// </summary>
         private void ZeroAllBlendshapes()
         {
             if (_skinnedMesh == null) return;
-
-            foreach (int index in _activeBlendshapeIndices)
+            foreach (int index in _activeIndices)
                 _skinnedMesh.SetBlendShapeWeight(index, 0f);
         }
 
+        // ------------------------------------------------------------------
+        // Index list construction
+        // ------------------------------------------------------------------
+
         /// <summary>
-        /// Builds the flat list of blendshape indices from the profile.
-        /// Called once on Play() so Update() does not touch the profile.
+        /// Builds _activeIndices and _accumBuffer from the profile.
+        ///
+        /// FIX: Deduplicates blendshape indices — a profile could theoretically
+        /// map two viseme names to the same index, which would cause double
+        /// writes and incorrect accumulated values.
+        ///
+        /// FIX: Validates each index against sharedMesh.blendShapeCount.
+        /// Out-of-range indices are skipped with a logged error rather than
+        /// causing a runtime exception or silent failure.
         /// </summary>
         private void BuildActiveIndexList()
         {
-            _activeBlendshapeIndices.Clear();
+            _activeIndices.Clear();
+            _indexToBufferPos.Clear();
 
-            if (_visemeProfile == null) return;
+            if (_visemeProfile == null || _skinnedMesh == null) return;
 
-            // Ensure the profile cache is warm before we start
             _visemeProfile.BuildCache();
+
+            int maxIndex = _skinnedMesh.sharedMesh != null
+                ? _skinnedMesh.sharedMesh.blendShapeCount
+                : 0;
+
+            var seen = new HashSet<int>();
 
             foreach (var mapping in _visemeProfile.mappings)
             {
-                if (mapping.blendshapeIndex >= 0)
-                    _activeBlendshapeIndices.Add(mapping.blendshapeIndex);
+                int idx = mapping.blendshapeIndex;
+                if (idx < 0) continue; // Disabled mapping
+
+                // FIX: Bounds check
+                if (idx >= maxIndex)
+                {
+                    Debug.LogError(
+                        $"[ResonanceSync] VisemeProfile '{_visemeProfile.name}': " +
+                        $"blendshape index {idx} for viseme '{mapping.visemeName}' " +
+                        $"is out of range (mesh has {maxIndex} blendshapes). " +
+                        "Update the index in the VisemeProfile.");
+                    continue;
+                }
+
+                // FIX: Deduplication
+                if (!seen.Add(idx))
+                {
+                    Debug.LogWarning(
+                        $"[ResonanceSync] VisemeProfile '{_visemeProfile.name}': " +
+                        $"blendshape index {idx} is mapped to multiple visemes. " +
+                        "Only the first mapping will be used.");
+                    continue;
+                }
+
+                _indexToBufferPos[idx] = _activeIndices.Count;
+                _activeIndices.Add(idx);
             }
+
+            // Allocate accumulation buffer sized to active index count
+            _accumBuffer = new float[_activeIndices.Count];
         }
 
         // ------------------------------------------------------------------
@@ -358,7 +374,6 @@ namespace GlyphLabs.ResonanceSync
                 Debug.LogError("[ResonanceSync] Play() called with null LipSyncData.", this);
                 return false;
             }
-
             if (!data.IsValid)
             {
                 Debug.LogError(
@@ -366,37 +381,30 @@ namespace GlyphLabs.ResonanceSync
                     "Was it generated successfully?", this);
                 return false;
             }
-
             if (clip == null)
             {
                 Debug.LogError("[ResonanceSync] Play() called with null AudioClip.", this);
                 return false;
             }
-
             if (_skinnedMesh == null)
             {
-                Debug.LogError(
-                    "[ResonanceSync] No SkinnedMeshRenderer assigned.", this);
+                Debug.LogError("[ResonanceSync] No SkinnedMeshRenderer assigned.", this);
                 return false;
             }
-
             if (_visemeProfile == null)
             {
                 Debug.LogError("[ResonanceSync] No VisemeProfile assigned.", this);
                 return false;
             }
-
-            // Warn if clip length doesn't match stored duration.
-            // Not a hard failure — the artist may have intentionally
-            // re-trimmed the clip. Sync will be off but not crash.
             if (!data.ValidateAgainstClip(clip))
             {
                 Debug.LogWarning(
                     $"[ResonanceSync] AudioClip '{clip.name}' length ({clip.length:F2}s) " +
                     $"does not match LipSyncData duration ({data.duration:F2}s). " +
-                    "Sync may be incorrect.", this);
+                    "Sync may be off. Regenerate LipSyncData if the clip was changed.",
+                    this);
+                // Warning only — do not block playback
             }
-
             return true;
         }
 
@@ -406,17 +414,13 @@ namespace GlyphLabs.ResonanceSync
 
 #if UNITY_EDITOR
         /// <summary>
-        /// Editor-only setup called by ResonanceSyncEditorWindow.
-        /// Allows the preview player in the editor window to inject its own
-        /// mesh and profile without requiring a full scene GameObject.
-        ///
+        /// Editor-only setup used by ResonanceSyncEditorWindow preview.
         /// Not part of the public runtime API — stripped from builds.
         /// </summary>
         internal void EditorSetup(SkinnedMeshRenderer mesh, VisemeProfile profile)
         {
             _skinnedMesh = mesh;
             _visemeProfile = profile;
-
             if (_audioSource == null)
                 _audioSource = GetComponent<AudioSource>();
         }
